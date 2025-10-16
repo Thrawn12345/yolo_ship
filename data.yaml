@@ -1,6 +1,6 @@
-train: C:\Users\Felhasznalo\Contacts\archive\ships-aerial-images\train\images
-val: C:\Users\Felhasznalo\Contacts\archive\ships-aerial-images\valid\images
-test: C:\Users\Felhasznalo\Contacts\archive\ships-aerial-images\test\images
+train: /home/mozer/projects/yolo_ship/archive/ships-aerial-images/train/images
+val: /home/mozer/projects/yolo_ship/archive/ships-aerial-images/valid/images
+test: /home/mozer/projects/yolo_ship/archive/ships-aerial-images/test/images
 
 nc: 1
 names: ['ship']
