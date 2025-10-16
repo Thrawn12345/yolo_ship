@@ -1,0 +1,6 @@
+train: C:\Users\Felhasznalo\Contacts\archive\ships-aerial-images\train\images
+val: C:\Users\Felhasznalo\Contacts\archive\ships-aerial-images\valid\images
+test: C:\Users\Felhasznalo\Contacts\archive\ships-aerial-images\test\images
+
+nc: 1
+names: ['ship']

@@ -1,0 +1,15 @@
+# Hyperparameters for demanding maritime ship detection
+# Geometric Augmentation
+scale: 0.2    # Aggressive scaling down (from 0.2 to 1.5)
+degrees: 15.0 # Increased rotation (up to +/- 15 degrees)
+shear: 5.0    # Add some shear distortion (up to +/- 5 degrees)
+perspective: 0.0005 # Small but non-zero perspective change
+
+# Photometric Augmentation (HSV)
+hsv_h: 0.1    # Increased Hue adjustment
+hsv_s: 0.7    # Aggressive Saturation adjustment
+hsv_v: 0.5    # Aggressive Brightness adjustment
+
+# Advanced Augmentation
+mosaic: 0.8   # High probability for mosaic
+mixup: 0.1    # Non-zero probability for mixup
