@@ -3,7 +3,8 @@ __pycache__/
 *.pyc
 runs/
 trained_models/
-*.pt
+yolo11*.pt
+!ship_detector_best.pt
 *.onnx
 .vscode/
 *.log
