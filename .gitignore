@@ -1,2 +1,11 @@
-venv
+venv/
+__pycache__/
+*.pyc
+runs/
+trained_models/
+*.pt
+*.onnx
+.vscode/
+*.log
+.DS_Storevenv
 archive

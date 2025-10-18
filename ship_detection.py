@@ -5,6 +5,10 @@ import torch
 import numpy as np
 import pandas as pd
 import os
+import argparse
+import tempfile
+import shutil
+import yaml
 from ultralytics import YOLO
 import squarify
 import matplotlib.pyplot as plt
@@ -116,25 +120,152 @@ def get_aggressive_hyperparameters():
         'mixup': 0.1,       # Probability for MixUp (blends 2 images)
     }
 
-def train_model(model, device):
-    """Train the YOLO model with GPU optimization"""
-    # Set GPU batch size based on available memory
-    gpu_batch_size = 16  # You can adjust this based on your GPU memory
-    
-    # Start the training session with GPU optimization
+def train_model(model, device, data_yaml='data.yaml', epochs=100):
+    """Train the YOLO model with GPU optimization and augmentation.
+
+    Determines a safe batch size from available GPU memory when a GPU is present
+    and passes the augmentation hyperparameters (hyp) returned by
+    `get_aggressive_hyperparameters()` into the trainer.
+    """
+
+    # Determine device/AMP and batch size
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        mem_gb = props.total_memory / 1e9
+        # Heuristic batch sizing based on GPU memory
+        if mem_gb >= 16:
+            batch = 16
+        elif mem_gb >= 8:
+            batch = 8
+        else:
+            # For small GPUs (e.g., 6GB) use a conservative batch
+            batch = 2
+        device_arg = 0
+        amp_flag = True
+    else:
+        batch = 4
+        device_arg = 'cpu'
+        amp_flag = False
+
+    # Workers: keep reasonable default, user can override in the script
+    workers = min(8, max(2, (os.cpu_count() or 4) // 2))
+
+    # If GPU memory is small, reduce image size and workers, avoid RAM caching
+    if torch.cuda.is_available() and mem_gb < 8:
+        imgsz = 416
+        # further reduce workers to avoid memory pressure
+        workers = min(workers, 4)
+        cache_mode = 'disk'  # avoid using too much RAM for cache
+    else:
+        imgsz = 640
+        cache_mode = True
+
+    # Augmentation hyperparameters
+    aug = get_aggressive_hyperparameters()
+
+    # Ultralytics train() does not accept a single 'hyp' dict here; instead pass
+    # augmentation keys individually. Filter augmentation keys to a whitelist
+    # accepted by the trainer to avoid argument errors.
+    valid_aug_keys = {
+        'scale', 'degrees', 'shear', 'perspective',
+        'hsv_h', 'hsv_s', 'hsv_v', 'mosaic', 'mixup'
+    }
+    aug_kwargs = {k: v for k, v in aug.items() if k in valid_aug_keys}
+
+    # set allocation conf to reduce fragmentation when necessary
+    if torch.cuda.is_available():
+        os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+
     results = model.train(
-        data='/home/mozer/projects/yolo_ship/data.yaml',   # Path to your ship dataset configuration
-        epochs=100,                       # Number of epochs to train
-        imgsz=640,                        # Image size
-        batch=gpu_batch_size if torch.cuda.is_available() else 8,
-        device=0 if torch.cuda.is_available() else 'cpu',
-        workers=4 if torch.cuda.is_available() else 4,
-        amp=True,                         # Automatic Mixed Precision for faster training
-        **get_aggressive_hyperparameters(),
-        name='ship_detection_aggressive_aug'
+        data=data_yaml,             # Dataset configuration file
+        epochs=epochs,              # Number of epochs to train
+        imgsz=imgsz,                # Image size (may be reduced on small GPUs)
+        batch=batch,                # Computed batch size
+        device=device_arg,          # GPU (int) or 'cpu'
+        workers=workers,            # Number of worker threads
+        amp=amp_flag,               # Automatic Mixed Precision when GPU available
+        single_cls=True,            # Single class detection (ships only)
+        rect=True,                  # Rectangular training
+        cos_lr=True,                # Cosine LR scheduler
+        close_mosaic=10,            # Disable mosaic augmentation for final epochs
+        cache=cache_mode,           # Cache mode (disk or True)
+        save=True,                  # Save checkpoints
+        **aug_kwargs,               # Unpack allowed augmentation args
+        name='ship_detection_aggressive_aug',
+        exist_ok=True
     )
-    
+
     return results
+
+
+def create_subset_dataset(src_data_yaml: str, subset_size: int, tmpdir: str | None = None):
+    """Create a temporary dataset using only a subset of training images.
+
+    Returns (temp_data_yaml_path, tmpdir_path). Caller should remove tmpdir when done.
+    """
+    if subset_size <= 0:
+        return src_data_yaml, None
+
+    # Load the source data.yaml
+    with open(src_data_yaml, 'r') as f:
+        cfg = yaml.safe_load(f)
+
+    train_path = cfg.get('train')
+    val_path = cfg.get('val')
+    test_path = cfg.get('test')
+    nc = cfg.get('nc', 1)
+    names = cfg.get('names', ['ship'])
+
+    train_images_dir = Path(train_path)
+    # guess labels dir by replacing 'images' with 'labels' if present
+    if 'images' in str(train_images_dir):
+        train_labels_dir = Path(str(train_images_dir).replace('/images', '/labels'))
+    else:
+        train_labels_dir = train_images_dir.parent / 'labels'
+
+    # collect image files
+    exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
+    all_images = [p for p in sorted(train_images_dir.iterdir()) if p.suffix.lower() in exts]
+    if len(all_images) == 0:
+        raise RuntimeError(f'No training images found in {train_images_dir}')
+
+    subset_size = min(subset_size, len(all_images))
+    random.seed(42)
+    subset = random.sample(all_images, subset_size)
+
+    # create temp dir
+    tmpdir_path = Path(tmpdir) if tmpdir else Path(tempfile.mkdtemp(prefix='yolo_subset_'))
+    tmp_train_images = tmpdir_path / 'train' / 'images'
+    tmp_train_labels = tmpdir_path / 'train' / 'labels'
+    tmp_train_images.mkdir(parents=True, exist_ok=True)
+    tmp_train_labels.mkdir(parents=True, exist_ok=True)
+
+    # copy subset images and labels
+    for img_path in subset:
+        dst_img = tmp_train_images / img_path.name
+        shutil.copy2(img_path, dst_img)
+        label_name = img_path.with_suffix('.txt').name
+        src_label = train_labels_dir / label_name
+        if src_label.exists():
+            shutil.copy2(src_label, tmp_train_labels / label_name)
+        else:
+            # create empty label file to avoid loader errors
+            (tmp_train_labels / label_name).write_text('')
+
+    # write new data.yaml
+    tmp_data = {
+        'train': str(tmp_train_images),
+        'val': val_path,
+        'test': test_path,
+        'nc': nc,
+        'names': names
+    }
+
+    tmp_data_yaml = tmpdir_path / 'data.yaml'
+    with open(tmp_data_yaml, 'w') as f:
+        yaml.safe_dump(tmp_data, f)
+
+    return str(tmp_data_yaml), str(tmpdir_path)
 
 def validate_model(model):
     """Validate the trained model"""
@@ -169,24 +300,68 @@ def save_model(model):
 
 def main():
     """Main execution function"""
-    # Setup CUDA and get device
+    # Setup device and print info
     device = setup_cuda()
-    
+
     # Set visualization style
     sns.set_style('darkgrid')
-    
-    # Load the model
-    model = YOLO("/home/mozer/projects/yolo_ship/yolo11n.pt")
-    model = model.to(device)
-    
-    # Train the model
-    results = train_model(model, device)
-    
-    # Validate the model
-    metrics = validate_model(model)
-    
-    # Save the model
-    save_model(model)
+    parser = argparse.ArgumentParser(description='Train YOLO ship detector')
+    parser.add_argument('--epochs', type=int, default=1, help='Number of epochs to train')
+    parser.add_argument('--subset', type=int, default=0, help='If >0, train on a subset of this many training images')
+    parser.add_argument('--no-clean', action='store_true', help="Don't delete temporary subset dir")
+    args = parser.parse_args()
+
+    try:
+        # Try to load the requested weights. If local 'yolo11x.pt' is not present
+        # attempt to load 'yolov8x.pt' which ultralytics can download automatically.
+        try:
+            print("Attempting to load 'yolo11x.pt' (local)")
+            model = YOLO('yolo11x.pt')
+            print("Loaded local 'yolo11x.pt'")
+        except Exception as e_local:
+            print("Local 'yolo11x.pt' not available or failed to load:", e_local)
+            try:
+                print("Falling back to 'yolov8x.pt' (will download if needed)")
+                model = YOLO('yolov8x.pt')
+                print("Loaded 'yolov8x.pt' (remote)")
+            except Exception as e_remote:
+                # As last resort try smaller model to reduce memory usage
+                try:
+                    print("Falling back to 'yolov8n.pt' (nano)")
+                    model = YOLO('yolov8n.pt')
+                    print("Loaded 'yolov8n.pt' (remote)")
+                except Exception:
+                    raise RuntimeError(
+                        "Failed to load any YOLO weights: tried 'yolo11x.pt', 'yolov8x.pt', and 'yolov8n.pt'. "
+                        "If you're offline, place your model file (yolo11x.pt) in the project root or specify a path."
+                    )
+
+        # Possibly create a temporary subset dataset
+        data_yaml_path = 'data.yaml'
+        tmpdir = None
+        if args.subset and args.subset > 0:
+            print(f'Creating dataset subset of {args.subset} images...')
+            data_yaml_path, tmpdir = create_subset_dataset('data.yaml', args.subset)
+
+        # Train using train_model which handles GPU/augmentation logic
+        print('Starting training (GPU if available)...')
+        results = train_model(model, device, data_yaml=data_yaml_path, epochs=args.epochs)
+
+        print('Training completed successfully!')
+
+        # Validate and save
+        validate_model(model)
+        save_model(model)
+        # cleanup
+        if tmpdir and not args.no_clean:
+            try:
+                shutil.rmtree(tmpdir)
+                print(f'Removed temporary dataset dir {tmpdir}')
+            except Exception:
+                print(f'Could not remove temporary dir {tmpdir}; you can remove it manually')
+    except Exception as e:
+        print(f'An error occurred during training: {str(e)}')
+        raise
 
 if __name__ == "__main__":
     main()
